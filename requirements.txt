@@ -1,0 +1,5 @@
+openai>=1.59.3        # for the OpenAI Python client
+websockets>=15.0.1    # for the realtime WebSocket connection
+sounddevice>=0.5.2    # for capturing microphone audio
+Pillow>=10.4.0        # for loading & resizing your logo
+certifi>=2025.4.26    # for SSL root certs
