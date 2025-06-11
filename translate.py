@@ -429,7 +429,7 @@ class TranslatorApp(tk.Tk):
             text_area = scrolledtext.ScrolledText(
                 column_frame,
                 wrap=tk.WORD,
-                font=("Helvetica", 22),
+                font=("Helvetica", 20),
                 bg=COLORS['secondary'],
                 fg=COLORS['text'],
                 relief=tk.FLAT,
