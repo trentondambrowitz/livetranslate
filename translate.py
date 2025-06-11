@@ -13,6 +13,7 @@ import threading
 import queue
 import ssl
 import certifi
+import time
 # near the top of your file, with your other imports:
 import sys
 
@@ -112,6 +113,11 @@ class TranscriptionWorker(threading.Thread):
             self.status_queue.put(f"Error: {str(e)}")
 
     async def run_transcription(self):
+        """
+        Maintain a resilient transcription session.  If the socket drops or the
+        server returns an error, we back-off and reconnect automatically until
+        self._stop_event is set.
+        """
         uri = "wss://api.openai.com/v1/realtime?intent=transcription"
         headers = {
             "Authorization": f"Bearer {API_KEY}",
@@ -119,29 +125,64 @@ class TranscriptionWorker(threading.Thread):
         }
         ssl_context = ssl.create_default_context()
         ssl_context.load_verify_locations(certifi.where())
-        
-        try:
-            async with websockets.connect(uri, additional_headers=headers, ssl=ssl_context) as ws:
-                self.status_queue.put("Connected. Listening...")
-                await ws.send(json.dumps({
-                    "type": "transcription_session.update",
-                    "session": {
-                        "input_audio_format": "pcm16",
-                        "input_audio_transcription": {"model": "gpt-4o-transcribe", "language": "en"},
-                        "turn_detection": {"type": "server_vad"}
-                    }
-                }))
-                sender_task = asyncio.create_task(self.sender(ws))
-                receiver_task = asyncio.create_task(self.receiver(ws))
-                with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype='int16', blocksize=BLOCK_SIZE, callback=self.audio_callback):
-                    while not self._stop_event.is_set():
-                        await asyncio.sleep(0.1)
-                sender_task.cancel()
-                receiver_task.cancel()
-                await asyncio.gather(sender_task, receiver_task, return_exceptions=True)
-        except Exception as e:
-            print(f"Connection failed: {e}")
-            self.status_queue.put(f"Connection Failed: {str(e)}")
+
+        backoff = 1          # seconds, doubled on each failure (capped)
+        MAX_BACKOFF = 16
+
+        while not self._stop_event.is_set():
+            try:
+                async with websockets.connect(uri,
+                                            additional_headers=headers,
+                                            ssl=ssl_context,
+                                            max_size=2**23) as ws:  # 8 MiB frames
+                    self.status_queue.put("Connected – listening…")
+                    backoff = 1   # reset back-off on successful connect
+
+                    # Configure the transcription session
+                    await ws.send(json.dumps({
+                        "type": "transcription_session.update",
+                        "session": {
+                            "input_audio_format": "pcm16",
+                            "input_audio_transcription": {
+                                "model": "gpt-4o-transcribe",
+                                "language": "en"
+                            },
+                            "turn_detection": {"type": "server_vad"}
+                        }
+                    }))
+
+                    # Launch sender / receiver subtasks
+                    sender_task   = asyncio.create_task(self.sender(ws))
+                    receiver_task = asyncio.create_task(self.receiver(ws))
+
+                    # Stream mic audio until stopped or error
+                    with sd.InputStream(samplerate=SAMPLE_RATE,
+                                        channels=CHANNELS,
+                                        dtype='int16',
+                                        blocksize=BLOCK_SIZE,
+                                        callback=self.audio_callback):
+                        while not self._stop_event.is_set():
+                            await asyncio.sleep(0.1)
+
+                    # Gracefully cancel streams
+                    sender_task.cancel()
+                    receiver_task.cancel()
+                    await asyncio.gather(sender_task, receiver_task,
+                                        return_exceptions=True)
+
+            except (websockets.exceptions.ConnectionClosedError,
+                    websockets.exceptions.InvalidStatusCode,
+                    OSError) as e:
+                self.status_queue.put(f"Connection lost ({e}). Reconnecting…")
+            except Exception as e:
+                self.status_queue.put(f"Unexpected error ({e}). Reconnecting…")
+
+            # Back-off if we’re still running
+            if not self._stop_event.is_set():
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+
+        self.status_queue.put("Stopped")
 
     def run(self):
         try:
@@ -162,24 +203,34 @@ class TranslationWorker(threading.Thread):
         self._stop_event.set()
         self.transcript_queue.put(None)
 
-    def translate(self, text, lang_name, lang_code):
-        try:
-            prompt = (
-                f"You are an expert translator. Translate the following English text to {lang_name}. "
-                f"Provide ONLY the translation, with no additional text, quotes, or explanations.\n\n"
-                f"English text: \"{text}\""
-            )
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=len(text) * 3
-            )
-            translation = response.choices[0].message.content.strip()
-            self.translation_queue.put((lang_name, translation))
-        except Exception as e:
-            print(f"Could not translate to {lang_name}: {e}")
-            self.translation_queue.put((lang_name, f"[Error: {e}]"))
+    def translate(self, text: str, lang_name: str, lang_code: str) -> None:
+        """
+        Translate with up to 3 retries and exponential back-off (1 s → 2 s → 4 s).
+        If all retries fail, we surface a readable error message so the GUI stays
+        responsive.
+        """
+        attempt, backoff = 0, 1
+        while attempt < 3 and not self._stop_event.is_set():
+            try:
+                prompt = (
+                    f"""You are an expert translator in a manufacturing setting, working for a company named Shoals which creates wiring and electical solutions for the solar industry. Translate the following English text to {lang_name}. Provide ONLY the translation:\n\n {text}"""
+                )
+                resp = self.client.chat.completions.create(
+                    model="gpt-4.1-mini-2025-04-14",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=min(len(text) * 3, 2000)  # hard cap
+                )
+                translation = resp.choices[0].message.content.strip()
+                self.translation_queue.put((lang_name, translation))
+                return                              # success → we’re done
+            except Exception as e:
+                attempt += 1
+                if attempt >= 3:
+                    self.translation_queue.put((lang_name, f"[⚠ error: {e}]"))
+                else:
+                    time.sleep(backoff)
+                    backoff *= 2
 
     def run(self):
         while not self._stop_event.is_set():
