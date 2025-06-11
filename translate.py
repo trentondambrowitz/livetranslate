@@ -449,6 +449,15 @@ class TranslatorApp(tk.Tk):
                 relief='flat'
             )
             
+            # **NEW**: configure a tag to add extra spacing below each inserted line
+                # after you create each text_area…
+            text_area.tag_configure(
+                "spacing",
+                spacing1=12,    # extra above a paragraph
+                spacing2=12,    # extra between wrapped‐lines
+                spacing3=12     # extra below a paragraph
+            )
+            
             self.translation_text_areas[lang_name] = text_area
         
         # Status bar at bottom
@@ -512,18 +521,20 @@ class TranslatorApp(tk.Tk):
             lang, text = self.translation_queue.get_nowait()
 
             if lang == "English":
-                # Update English transcription
+                # Update English transcription (unchanged)
                 self.english_text.configure(state='normal')
                 self.english_text.insert(tk.END, text + "\n")
-                # force the view all the way to the bottom
                 self.english_text.yview_moveto(1.0)
                 self.english_text.configure(state='disabled')
 
             elif lang in self.translation_text_areas:
-                # unchanged for the other languages
                 text_area = self.translation_text_areas[lang]
                 text_area.configure(state='normal')
-                text_area.insert(tk.END, text + "\n\n")
+
+                # break out each line so every line gets the spacing tag
+                for line in text.splitlines():
+                    text_area.insert(tk.END, line + "\n", "spacing")
+
                 text_area.see(tk.END)
                 text_area.configure(state='disabled')
 
