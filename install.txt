@@ -11,3 +11,7 @@ pyinstaller ^
   --windowed ^
   --add-data "Shoals_Master_Logo_Green-logo-white-text.png;." ^
   translate.py
+
+
+cd dist
+powershell Compress-Archive -Path translate.exe -DestinationPath translate.zip
